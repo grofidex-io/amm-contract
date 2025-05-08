@@ -23,9 +23,10 @@ contract AMMStake is INonfungiblePositionManagerStruct, Multicall, Ownable, Reen
         address token0;
         // V3 pool token1 address
         address token1;
-        // V3 pool fee
         uint24 fee;
         uint256 tokensPerSecond;
+        uint32 startTime;
+        uint32 endTime;
     }
 
     struct UserPositionInfo {
@@ -42,11 +43,6 @@ contract AMMStake is INonfungiblePositionManagerStruct, Multicall, Ownable, Reen
     /// @notice userPositionInfos[tokenId] => UserPositionInfo
     /// @dev TokenId is unique, and we can query the pid by tokenId.
     mapping(uint256 => UserPositionInfo) public userPositionInfos;
-
-    /// @notice v3PoolPid[token0][token1][fee] => pid
-    mapping(address => mapping(address => mapping(uint24 => uint256))) v3PoolPid;
-    /// @notice v3PoolAddressPid[v3PoolAddress] => pid
-    mapping(address => uint256) public v3PoolAddressPid;
 
     /// @notice Address of CAKE contract.
     IERC20 public immutable CAKE;
@@ -72,8 +68,8 @@ contract AMMStake is INonfungiblePositionManagerStruct, Multicall, Ownable, Reen
     error InconsistentAmount();
     error InsufficientAmount();
 
-    event AddPool(uint256 indexed pid, IPancakeV3Pool indexed v3Pool);
-    event SetPool(uint256 indexed pid, uint256 allocPoint);
+    event AddPool(uint256 indexed pid, IPancakeV3Pool indexed v3Pool, uint256 indexed tokenPerSecond, uint32 startTime, uint32 endTime);
+    event SetPool(uint256 indexed pid, uint256 indexed tokenPerSecond, uint32 startTime, uint32 endTime);
     event Deposit(
         address indexed from,
         uint256 indexed pid,
@@ -118,16 +114,23 @@ contract AMMStake is INonfungiblePositionManagerStruct, Multicall, Ownable, Reen
         UserPositionInfo memory positionInfo = userPositionInfos[_tokenId];
         if (positionInfo.pid != 0) {
             PoolInfo memory pool = poolInfo[positionInfo.pid];
-            reward = pool.tokensPerSecond * (block.timestamp - uint256(positionInfo.latestClaimReward));
+            if (positionInfo.latestClaimReward >= pool.endTime) {
+              reward = 0;
+            } else if (block.timestamp < pool.startTime) {
+              reward = 0;
+            } else if (block.timestamp > pool.endTime) {
+              reward = pool.tokensPerSecond * (pool.endTime - uint256(positionInfo.latestClaimReward));
+            } else {
+              reward = pool.tokensPerSecond * (block.timestamp - uint256(positionInfo.latestClaimReward));
+            }
         }
+        
     }
 
-    function add(IPancakeV3Pool _v3Pool, uint256 _tokensPerSecond) external onlyOwner {
-
+    function add(IPancakeV3Pool _v3Pool, uint256 _tokensPerSecond, uint32 _startTime, uint32 _endTime) external onlyOwner {
+        require(_startTime < _endTime, "Invalid time");
         address token0 = _v3Pool.token0();
         address token1 = _v3Pool.token1();
-        uint24 fee = _v3Pool.fee();
-        if (v3PoolPid[token0][token1][fee] != 0) revert DuplicatedPool(v3PoolPid[token0][token1][fee]);
         if (IERC20(token0).allowance(address(this), address(nonfungiblePositionManager)) == 0)
             IERC20(token0).safeApprove(address(nonfungiblePositionManager), type(uint256).max);
         if (IERC20(token1).allowance(address(this), address(nonfungiblePositionManager)) == 0)
@@ -139,44 +142,35 @@ contract AMMStake is INonfungiblePositionManagerStruct, Multicall, Ownable, Reen
             v3Pool: _v3Pool,
             token0: token0,
             token1: token1,
-            fee: fee,
-            tokensPerSecond: _tokensPerSecond
+            tokensPerSecond: _tokensPerSecond,
+            startTime: _startTime,
+            endTime: _endTime,
+            fee: _v3Pool.fee()
         });
-
-        v3PoolPid[token0][token1][fee] = poolLength;
-        v3PoolAddressPid[address(_v3Pool)] = poolLength;
-        emit AddPool(poolLength, _v3Pool);
+        emit AddPool(poolLength, _v3Pool, _tokensPerSecond, _startTime, _endTime);
     }
 
-    // function set(uint256 _pid, uint256 _allocPoint, bool _withUpdate) external onlyOwner onlyValidPid(_pid) {
-    //     uint32 currentTime = uint32(block.timestamp);
-    //     PoolInfo storage pool = poolInfo[_pid];
-    //     ILMPool LMPool = ILMPool(pool.v3Pool.lmPool());
-    //     if (address(LMPool) != address(0)) {
-    //         LMPool.accumulateReward(currentTime);
-    //     }
-
-    //     if (_withUpdate) massUpdatePools();
-    //     totalAllocPoint = totalAllocPoint - pool.allocPoint + _allocPoint;
-    //     pool.allocPoint = _allocPoint;
-    //     emit SetPool(_pid, _allocPoint);
-    // }
+    function set(uint256 _pid, uint256 _tokensPerSecond, uint32 _startTime, uint32 _endTime) external onlyOwner onlyValidPid(_pid) {
+        require(_startTime < _endTime, "Invalid time");
+        poolInfo[poolLength].tokensPerSecond = _tokensPerSecond;
+        poolInfo[poolLength].startTime = _startTime;
+        poolInfo[poolLength].endTime = _endTime;
+        emit SetPool(_pid, _tokensPerSecond, _startTime, _endTime);
+    }
 
     struct DepositCache {
         address token0;
         address token1;
-        uint24 fee;
         uint128 liquidity;
+        uint24 fee;
     }
 
-    /// @notice Upon receiving a ERC721
-    function onERC721Received(
-        address,
-        address _from,
-        uint256 _tokenId,
-        bytes calldata
-    ) external nonReentrant returns (bytes4) {
-        if (msg.sender != address(nonfungiblePositionManager)) revert NotPancakeNFT();
+    function stakeLP(uint256 pid, uint256 tokenId) external nonReentrant {
+        require(pid <= poolLength, "Invalid pid");
+        PoolInfo memory pool = poolInfo[pid];
+        require(pool.endTime > block.timestamp, "Pool has ended");
+        nonfungiblePositionManager.safeTransferFrom(msg.sender, address(this), tokenId);
+        UserPositionInfo storage positionInfo = userPositionInfos[tokenId];
         DepositCache memory cache;
         (
             ,
@@ -190,21 +184,39 @@ contract AMMStake is INonfungiblePositionManagerStruct, Multicall, Ownable, Reen
             ,
             ,
             ,
-
-        ) = nonfungiblePositionManager.positions(_tokenId);
+        ) = nonfungiblePositionManager.positions(tokenId);
         if (cache.liquidity == 0) revert NoLiquidity();
-        uint256 pid = v3PoolPid[cache.token0][cache.token1][cache.fee];
-        if (pid == 0) revert InvalidNFT();
-
-        UserPositionInfo storage positionInfo = userPositionInfos[_tokenId];
-
-        positionInfo.user = _from;
+        if (cache.token0 != pool.token0 || cache.token1 != pool.token1 || cache.fee != pool.fee) revert InvalidNFT();
+        positionInfo.user = msg.sender;
         positionInfo.pid = pid;
-        positionInfo.latestClaimReward = uint64(block.timestamp);
+        if (pool.startTime > block.timestamp) {
+            positionInfo.latestClaimReward = uint64(pool.startTime);
+        } else {
+            positionInfo.latestClaimReward = uint64(block.timestamp);
+        }
 
-        updateLiquidityOperation(positionInfo, _tokenId);
-        emit Deposit(_from, pid, _tokenId);
+        updateLiquidityOperation(positionInfo, tokenId);
+        addToken(msg.sender, tokenId);
+        emit Deposit(msg.sender, pid, tokenId);
 
+    }
+
+    function sweepToken(address token, uint256 amountMinimum, address recipient) external nonReentrant {
+        uint256 balanceToken = IERC20(token).balanceOf(address(this));
+        if (balanceToken < amountMinimum) revert InsufficientAmount();
+
+        if (balanceToken > 0) {
+            IERC20(token).safeTransfer(recipient, balanceToken);
+        }
+    }
+
+    /// @notice Upon receiving a ERC721
+    function onERC721Received(
+        address,
+        address,
+        uint256,
+        bytes calldata
+    ) external pure returns (bytes4) {
         return this.onERC721Received.selector;
     }
 
@@ -221,7 +233,15 @@ contract AMMStake is INonfungiblePositionManagerStruct, Multicall, Ownable, Reen
         address _to
     ) internal returns (uint256 reward) {
         PoolInfo memory pool = poolInfo[positionInfo.pid];
-        reward = pool.tokensPerSecond * (block.timestamp - uint256(positionInfo.latestClaimReward));
+        if (positionInfo.latestClaimReward >= pool.endTime) {
+            reward = 0;
+        } else if (block.timestamp < pool.startTime ) {
+          reward = 0;
+        } else if (block.timestamp > pool.endTime) {
+          reward = pool.tokensPerSecond * (pool.endTime - uint256(positionInfo.latestClaimReward));
+        } else {
+          reward = pool.tokensPerSecond * (block.timestamp - uint256(positionInfo.latestClaimReward));
+        }
         positionInfo.latestClaimReward = uint64(block.timestamp);
         if (reward > 0) {
             if (_to != address(0)) {
@@ -246,7 +266,6 @@ contract AMMStake is INonfungiblePositionManagerStruct, Multicall, Ownable, Reen
     function updateLiquidity(uint256 _tokenId) external nonReentrant {
         UserPositionInfo storage positionInfo = userPositionInfos[_tokenId];
         if (positionInfo.pid == 0) revert InvalidNFT();
-        harvestOperation(positionInfo, _tokenId, address(0));
         updateLiquidityOperation(positionInfo, _tokenId);
     }
 
@@ -268,7 +287,6 @@ contract AMMStake is INonfungiblePositionManagerStruct, Multicall, Ownable, Reen
         if (token1Left > 0) {
             refund(pool.token1, token1Left);
         }
-        harvestOperation(positionInfo, params.tokenId, address(0));
         updateLiquidityOperation(positionInfo, params.tokenId);
     }
 
@@ -307,7 +325,6 @@ contract AMMStake is INonfungiblePositionManagerStruct, Multicall, Ownable, Reen
         UserPositionInfo storage positionInfo = userPositionInfos[params.tokenId];
         if (positionInfo.user != msg.sender) revert NotOwner();
         (amount0, amount1) = nonfungiblePositionManager.decreaseLiquidity(params);
-        harvestOperation(positionInfo, params.tokenId, address(0));
         updateLiquidityOperation(positionInfo, params.tokenId);
     }
 
@@ -390,6 +407,10 @@ contract AMMStake is INonfungiblePositionManagerStruct, Multicall, Ownable, Reen
           }
           CAKE.safeTransfer(_to, _amount);
       }
+    }
+
+    function withdrawReward(uint256 _amount) external onlyOwner {
+        CAKE.safeTransfer(msg.sender, _amount);
     }
 
     receive() external payable {
